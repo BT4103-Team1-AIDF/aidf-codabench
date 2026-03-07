@@ -19,6 +19,10 @@ from django.utils.text import slugify
 from django.utils.timezone import now
 from rest_framework.exceptions import ValidationError
 
+from urllib.request import urlopen
+from contextlib import closing
+from urllib.error import ContentTooShortError
+
 from celery_config import app
 from competitions.models import Submission, CompetitionCreationTaskStatus, SubmissionDetails, Competition, \
     CompetitionDump, Phase
@@ -51,7 +55,8 @@ COMPETITION_FIELDS = [
     "reward",
     "contact_email",
     "fact_sheet",
-    "forum_enabled"
+    "forum_enabled",
+    "model_card_visibility",
 ]
 
 TASK_FIELDS = [
@@ -115,6 +120,26 @@ COLUMN_FIELDS = [
     'precision',
 ]
 MAX_EXECUTION_TIME_LIMIT = int(os.environ.get('MAX_EXECUTION_TIME_LIMIT', 600))  # time limit of the default queue
+
+
+def extract_model_card_to_json(pdf_path):
+    """Extract a minimal model-card JSON payload from a PDF file."""
+    try:
+        import pdfplumber
+    except ImportError as exc:
+        raise RuntimeError("Model card parsing requires the optional dependency `pdfplumber`.") from exc
+
+    with pdfplumber.open(pdf_path) as pdf:
+        pages = [page.extract_text() or "" for page in pdf.pages]
+
+    return {
+        "model_name": "",
+        "description": "",
+        "intended_use": "",
+        "limitations": "",
+        "page_count": len(pages),
+        "raw_text": "\n".join(pages).strip(),
+    }
 
 
 def _send_to_compute_worker(submission, is_scoring):
@@ -274,6 +299,83 @@ def send_child_id(submission, child_id):
         "kind": "child_update",
         "child_id": child_id
     })
+
+
+def retrieve_data(url, data=None):
+    with closing(urlopen(url, data)) as fp:
+        headers = fp.info()
+
+        bs = 1024 * 8
+        size = -1
+        read = 0
+        if "content-length" in headers:
+            size = int(headers["Content-Length"])
+
+        while True:
+            block = fp.read(bs)
+            if not block:
+                break
+            read += len(block)
+            yield(block)
+
+    if size >= 0 and read < size:
+        raise ContentTooShortError(
+            "retrieval incomplete: got only %i out of %i bytes"
+            % (read, size))
+
+
+def zip_generator(submission_pks):
+    in_memory_zip = BytesIO()
+    with zipfile.ZipFile(in_memory_zip, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for submission_id in submission_pks:
+            submission = Submission.objects.get(id=submission_id)
+            short_name = "ID_" + str(submission_id) + '_' + submission.data.data_file.name.split('/')[-1]
+            url = make_url_sassy(path=submission.data.data_file.name)
+            for block in retrieve_data(url):
+                zip_file.writestr(short_name, block)
+
+    in_memory_zip.seek(0)
+
+    return in_memory_zip
+
+
+@app.task(queue='site-worker', soft_time_limit=60 * 60)
+def stream_batch_download(submission_pks):
+    return zip_generator(submission_pks)
+
+
+@app.task(queue='site-worker', soft_time_limit=60 * 5)
+def parse_model_card(submission_pk):
+    try:
+        submission = Submission.objects.get(pk=submission_pk)
+    except Submission.DoesNotExist:
+        logger.warning(f"Skipping model card parse for unknown submission id={submission_pk}")
+        return
+
+    if not submission.model_card:
+        submission.model_card_status = Submission.MODEL_CARD_FAILED
+        submission.model_card_error = "No model card file found for this submission."
+        submission.save(update_fields=['model_card_status', 'model_card_error'])
+        return
+
+    try:
+        with NamedTemporaryFile(mode='w+b', suffix='.pdf') as temp_file:
+            with submission.model_card.open('rb') as source:
+                temp_file.write(source.read())
+                temp_file.flush()
+
+            parsed_data = extract_model_card_to_json(temp_file.name)
+
+        submission.model_card_json = parsed_data
+        submission.model_card_status = Submission.MODEL_CARD_PARSED
+        submission.model_card_error = None
+
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Model card parsing failed for submission id={submission_pk}: {exc}")
+        submission.model_card_status = Submission.MODEL_CARD_FAILED
+        submission.model_card_error = str(exc)
+
+    submission.save(update_fields=['model_card_json', 'model_card_status', 'model_card_error'])
 
 
 @app.task(queue='site-worker', soft_time_limit=60)

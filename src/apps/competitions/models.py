@@ -4,6 +4,7 @@ import io
 
 import botocore.exceptions
 from django.conf import settings
+from django.contrib.postgres.fields import JSONField
 from django.core.files.base import ContentFile
 from django.db import models
 from django.db.models import Q
@@ -31,6 +32,13 @@ class Competition(models.Model):
     COMPETITION_TYPE = (
         (COMPETITION, "competition"),
         (BENCHMARK, "benchmark"),
+    )
+
+    MODEL_CARD_PUBLIC = "public"
+    MODEL_CARD_PRIVATE = "private"
+    MODEL_CARD_VISIBILITY_CHOICES = (
+        (MODEL_CARD_PUBLIC, "Public"),
+        (MODEL_CARD_PRIVATE, "Private"),
     )
 
     title = models.CharField(max_length=256)
@@ -62,7 +70,7 @@ class Competition(models.Model):
     # we use filed type to distinguish 'competition' and 'benchmark'
     competition_type = models.CharField(max_length=128, choices=COMPETITION_TYPE, default=COMPETITION)
 
-    fact_sheet = models.JSONField(blank=True, null=True, max_length=4096, default=None)
+    fact_sheet = JSONField(blank=True, null=True, max_length=4096, default=None)
 
     contact_email = models.EmailField(max_length=256, null=True, blank=True)
     reward = models.CharField(max_length=256, null=True, blank=True)
@@ -86,6 +94,13 @@ class Competition(models.Model):
 
     # If true, forum is enabled (default=True)
     forum_enabled = models.BooleanField(default=True)
+
+    # Controls who can access model cards attached to submissions for this competition.
+    model_card_visibility = models.CharField(
+        max_length=10,
+        choices=MODEL_CARD_VISIBILITY_CHOICES,
+        default=MODEL_CARD_PRIVATE,
+    )
 
     def __str__(self):
         return f"competition-{self.title}-{self.pk}-{self.competition_type}"
@@ -444,6 +459,17 @@ class Submission(models.Model):
         (FAILED, "Failed"),
     )
 
+    MODEL_CARD_NONE = "NONE"
+    MODEL_CARD_PENDING = "PENDING"
+    MODEL_CARD_PARSED = "PARSED"
+    MODEL_CARD_FAILED = "FAILED"
+    MODEL_CARD_STATUS_CHOICES = (
+        (MODEL_CARD_NONE, "None"),
+        (MODEL_CARD_PENDING, "Pending"),
+        (MODEL_CARD_PARSED, "Parsed"),
+        (MODEL_CARD_FAILED, "Failed"),
+    )
+
     description = models.CharField(max_length=240, default="", blank=True, null=True)
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, related_name='submission', on_delete=models.DO_NOTHING)
     organization = models.ForeignKey(Organization, related_name='submissions', on_delete=models.DO_NOTHING, null=True)
@@ -464,6 +490,17 @@ class Submission(models.Model):
     prediction_result_file_size = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)  # in Bytes
     scoring_result_file_size = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)  # in Bytes
     detailed_result_file_size = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)  # in Bytes
+    model_card = models.FileField(upload_to=PathWrapper('model_cards'), null=True, blank=True, storage=BundleStorage)
+
+    model_card_file_size = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)  # in Bytes
+    model_card_status = models.CharField(
+        max_length=20,
+        choices=MODEL_CARD_STATUS_CHOICES,
+        default=MODEL_CARD_NONE,
+    )
+    model_card_json = JSONField(null=True, blank=True)
+    model_card_error = models.TextField(null=True, blank=True)
+
 
     secret = models.UUIDField(default=uuid.uuid4)
     celery_task_id = models.UUIDField(null=True, blank=True)
@@ -495,7 +532,7 @@ class Submission(models.Model):
     has_children = models.BooleanField(default=False)
     parent = models.ForeignKey('Submission', on_delete=models.CASCADE, blank=True, null=True, related_name='children')
 
-    fact_sheet_answers = models.JSONField(null=True, blank=True, max_length=4096)
+    fact_sheet_answers = JSONField(null=True, blank=True, max_length=4096)
 
     # True when submission owner deletes a submission
     is_soft_deleted = models.BooleanField(default=False)
@@ -520,6 +557,11 @@ class Submission(models.Model):
         self.scoring_result_file_size = 0
         self.detailed_result.delete(save=False)
         self.detailed_result_file_size = 0
+        self.model_card.delete(save=False)
+        self.model_card_file_size = 0
+        self.model_card_status = Submission.MODEL_CARD_NONE
+        self.model_card_json = None
+        self.model_card_error = None
 
         # Delete related SubmissionDetails files and records
         for detail in self.details.all():
@@ -543,6 +585,7 @@ class Submission(models.Model):
         self.save()
 
     def delete(self, **kwargs):
+        self.model_card.delete(save=False)
 
         # Check if any other submissions are using the same data
         other_submissions_using_data = Submission.objects.filter(data=self.data).exclude(pk=self.pk).exists()
@@ -577,6 +620,7 @@ class Submission(models.Model):
             'prediction_result': 'prediction_result_file_size',
             'scoring_result': 'scoring_result_file_size',
             'detailed_result': 'detailed_result_file_size',
+            'model_card': 'model_card_file_size',
         }
         for file_path_attr, file_size_attr in files_and_sizes_dict.items():
             if getattr(self, file_path_attr) and (not getattr(self, file_size_attr) or getattr(self, file_size_attr) == -1):
@@ -711,6 +755,23 @@ class Submission(models.Model):
         elif self.has_children:
             on_leaderboard = bool(self.children.first().leaderboard)
         return on_leaderboard
+
+    def can_user_view_model_card(self, user):
+        if not self.model_card:
+            return False
+
+        if self.phase.competition.model_card_visibility == Competition.MODEL_CARD_PUBLIC:
+            return True
+
+        if not user or not user.is_authenticated:
+            return False
+
+        return user == self.owner or self.phase.competition.user_has_admin_permission(user)
+
+    def get_model_card_url(self):
+        if not self.model_card:
+            return None
+        return make_url_sassy(self.model_card.name)
 
 
 class CompetitionParticipant(models.Model):
