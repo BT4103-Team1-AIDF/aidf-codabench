@@ -540,9 +540,8 @@ class PhaseResultsTaskSerializer(serializers.Serializer):
     columns = ColumnSerializer(many=True)
     name = serializers.CharField()
 
-
 class PhaseResultsSerializer(serializers.Serializer):
     title = serializers.CharField()
     id = serializers.IntegerField()
     tasks = PhaseResultsTaskSerializer(many=True, read_only=True)
-    submissions = PhaseResultsSubmissionSerializer(many=True)`r`n
+    submissions = PhaseResultsSubmissionSerializer(many=True)

@@ -308,6 +308,43 @@ class SubmissionAPITests(APITestCase):
         assert self.existing_submission.model_card
         parse_delay.assert_called_once_with(self.existing_submission.pk)
 
+    def test_participant_can_create_submission_then_upload_model_card(self):
+        self.client.force_login(self.participant)
+
+        submission_data = DataFactory(
+            created_by=self.participant,
+            type=Data.SUBMISSION,
+            data_file=ContentFile(b'PK\x03\x04mock submission zip', 'submission.zip'),
+        )
+
+        create_url = reverse('submission-list')
+        with mock.patch('competitions.tasks._send_to_compute_worker'):
+            create_resp = self.client.post(
+                create_url,
+                {'phase': self.phase.pk, 'data': str(submission_data.key)},
+            )
+
+        assert create_resp.status_code == 201
+        submission_pk = create_resp.data['id']
+
+        upload_url = reverse('submission-upload-model-card', args=(submission_pk,))
+        model_card_file = SimpleUploadedFile(
+            'model_card.pdf',
+            b'%PDF-1.4\n% model card for created submission',
+            content_type='application/pdf',
+        )
+
+        with mock.patch('competitions.tasks.parse_model_card.delay') as parse_delay:
+            upload_resp = self.client.post(upload_url, {'model_card': model_card_file}, format='multipart')
+
+        assert upload_resp.status_code == 202
+        assert upload_resp.data['status'] == Submission.MODEL_CARD_PENDING
+
+        created_submission = Submission.objects.get(pk=submission_pk)
+        assert created_submission.model_card
+        assert created_submission.model_card_status == Submission.MODEL_CARD_PENDING
+        parse_delay.assert_called_once_with(submission_pk)
+
     def test_non_owner_cannot_upload_model_card(self):
         url = reverse('submission-upload-model-card', args=(self.existing_submission.pk,))
         self.client.force_login(self.other_user)
@@ -766,3 +803,4 @@ class SubmissionSoftDeletionTest(APITestCase):
         self.organization_submission.refresh_from_db()
         assert self.organization_submission.is_soft_deleted is True
         assert self.organization_submission.organization is None
+
