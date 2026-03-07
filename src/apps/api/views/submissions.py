@@ -9,16 +9,19 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import SearchFilter
 from rest_framework.generics import get_object_or_404
 from rest_framework.permissions import AllowAny
+from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
 from rest_framework.viewsets import ModelViewSet
 from rest_framework_csv import renderers
 from django.core.files.base import ContentFile
+from django.http import StreamingHttpResponse
 
 from profiles.models import Organization, Membership
 from tasks.models import Task
-from api.serializers.submissions import SubmissionCreationSerializer, SubmissionSerializer, SubmissionFilesSerializer, SubmissionDetailSerializer
+from api.serializers.submissions import SubmissionCreationSerializer, SubmissionSerializer, SubmissionFilesSerializer
 from competitions.models import Submission, SubmissionDetails, Phase, CompetitionParticipant
+from competitions.tasks import parse_model_card
 from leaderboards.strategies import put_on_leaderboard_by_submission_rule
 from leaderboards.models import SubmissionScore, Column, Leaderboard
 import logging
@@ -91,7 +94,7 @@ class SubmissionViewSet(ModelViewSet):
 
             not_bot_user = self.request.user.is_authenticated and not self.request.user.is_bot
 
-            if self.action in ['update_fact_sheet', 'run_submission', 're_run_submission']:
+            if self.action in ['update_fact_sheet', 'run_submission', 're_run_submission', 'upload_model_card']:
                 # get_queryset will stop us from re-running something we're not supposed to
                 pass
             elif not self.request.user.is_authenticated or not_bot_user:
@@ -219,27 +222,6 @@ class SubmissionViewSet(ModelViewSet):
         self.perform_destroy(submission)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-    def check_submission_permissions(self, request, submissions):
-        # Check permissions
-        if not request.user.is_authenticated:
-            raise PermissionDenied("You must be logged in to download submissions")
-        # Allow admins
-        if request.user.is_superuser or request.user.is_staff:
-            allowed = True
-        else:
-            # Build one Q object for "owner OR organizer"
-            organiser_q = (
-                Q(phase__competition__created_by=request.user) |
-                Q(phase__competition__collaborators=request.user)
-            )
-            # Submissions that violate the rule
-            disallowed = submissions.exclude(Q(owner=request.user) | organiser_q)
-            allowed = not disallowed.exists()
-        if not allowed:
-            raise PermissionDenied(
-                "You do not have permission to download one or more of the requested submissions"
-            )
-
     @action(detail=True, methods=('DELETE',))
     def soft_delete(self, request, pk):
         submission = self.get_object()
@@ -267,6 +249,65 @@ class SubmissionViewSet(ModelViewSet):
         # soft delete submission and return success response
         submission.soft_delete()
         return Response({'message': 'Submission deleted successfully'}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=('POST',), parser_classes=(MultiPartParser, FormParser))
+    def upload_model_card(self, request, pk):
+        submission = self.get_object()
+
+        if request.user != submission.owner and not self.has_admin_permission(request.user, submission):
+            raise PermissionDenied("You do not have permission to upload a model card for this submission")
+
+        model_card_file = request.FILES.get("model_card")
+        if not model_card_file:
+            return Response({"error": "`model_card` file is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not model_card_file.name.lower().endswith(".pdf"):
+            return Response({"error": "Model card must be a PDF file."}, status=status.HTTP_400_BAD_REQUEST)
+
+        submission.model_card.save(model_card_file.name, model_card_file, save=False)
+        submission.model_card_status = Submission.MODEL_CARD_PENDING
+        submission.model_card_json = None
+        submission.model_card_error = None
+        submission.save(update_fields=['model_card', 'model_card_file_size', 'model_card_status', 'model_card_json', 'model_card_error'])
+
+        parse_model_card.delay(submission.pk)
+
+        return Response({"status": submission.model_card_status}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=('GET',), permission_classes=(AllowAny,))
+    def model_card(self, request, pk):
+        submission = get_object_or_404(
+            Submission.objects.select_related('phase__competition', 'owner'),
+            pk=pk,
+            is_soft_deleted=False,
+        )
+
+        is_owner_or_admin = request.user.is_authenticated and (
+            request.user == submission.owner or self.has_admin_permission(request.user, submission)
+        )
+        is_public_model_card = (
+            submission.phase.competition.model_card_visibility == submission.phase.competition.MODEL_CARD_PUBLIC
+            and submission.status == Submission.FINISHED
+            and submission.on_leaderboard
+        )
+
+        if not is_owner_or_admin and not is_public_model_card:
+            raise PermissionDenied("You do not have permission to access this model card")
+
+        if not submission.model_card:
+            return Response({
+                "status": Submission.MODEL_CARD_NONE,
+                "url": None,
+                "json": None,
+                "error": None,
+            })
+
+        return Response({
+            "status": submission.model_card_status,
+            "url": submission.get_model_card_url(),
+            "json": submission.model_card_json,
+            "error": submission.model_card_error,
+        })
 
     @action(detail=False, methods=('DELETE',))
     def delete_many(self, request, *args, **kwargs):
@@ -404,28 +445,26 @@ class SubmissionViewSet(ModelViewSet):
             submission.re_run()
         return Response({})
 
-    # TODO: The 3 functions download many should be bundled inside a genereic with the function like "get_prediction_result" as a parameter instead of the same code 3 times
-    @action(detail=False, methods=('POST',))
+    @action(detail=False, methods=['get'])
     def download_many(self, request):
-        pks = request.data.get('pks')
-        if not pks:
-            return Response({"error": "`pks` field is required"}, status=400)
-
-        # pks is already parsed as a list if JSON was sent properly
-        if not isinstance(pks, list):
-            return Response({"error": "`pks` must be a list"}, status=400)
+        """
+        Download a ZIP containing several submissions.
+        """
+        pks = request.query_params.get('pks')
+        if pks:
+            pks = json.loads(pks)  # Convert JSON string to list
+        else:
+            return Response({"error": "`pks` query parameter is required"}, status=400)
 
         # Get submissions
         submissions = Submission.objects.filter(pk__in=pks).select_related(
             "owner",
-            "phase",
-            "data"
-        )
-
-        if len(list(submissions)) != len(pks):
+            "phase__competition",
+            "phase__competition__created_by",
+        ).prefetch_related("phase__competition__collaborators")
+        if submissions.count() != len(pks):
             return Response({"error": "One or more submission IDs are invalid"}, status=404)
 
-        # Nicolas Homberg : should create a function for this ?
         # Check permissions
         if not request.user.is_authenticated:
             raise PermissionDenied("You must be logged in to download submissions")
@@ -446,29 +485,12 @@ class SubmissionViewSet(ModelViewSet):
                 "You do not have permission to download one or more of the requested submissions"
             )
 
-        files = []
-
-        for sub in submissions:
-            file_path = sub.data.data_file.name.split('/')[-1]
-            short_name = f"{sub.id}_{sub.owner}_PhaseId{sub.phase.id}_{sub.data.created_when.strftime('%Y-%m-%d:%M-%S')}_{file_path}"
-            # url = sub.data.data_file.url
-            url = SubmissionDetailSerializer(sub.data, context=self.get_serializer_context()).data['data_file']
-            # url = SubmissionFilesSerializer(sub, context=self.get_serializer_context()).data['data_file']
-            files.append({"name": short_name, "url": url})
-
-        return Response(files)
-
-        for sub in submissions:
-            if sub.status not in [Submission.FINISHED]:  # Submission.FAILED, Submission.CANCELLED
-                continue
-            file_path = sub.data.data_file.name.split('/')[-1]
-            complete_name = f"res_{sub.id}_{sub.owner}_PhaseId{sub.phase.id}_{sub.data.created_when.strftime('%Y-%m-%d:%M-%S')}_{file_path}"
-            result_url = SubmissionDetailSerializer(sub.data, context=self.get_serializer_context()).get_scoring_result(sub)
-            # detailed results is already in the results zip file but For very large detailed results it could be helpfull to remove it
-            # detailed_result_url = serializer.get_scoring_result(sub)
-            files.append({"name": complete_name, "url": result_url})
-
-        return Response(files)
+        # Download
+        from competitions.tasks import stream_batch_download
+        in_memory_zip = stream_batch_download(pks)
+        response = StreamingHttpResponse(in_memory_zip, content_type='application/zip')
+        response['Content-Disposition'] = 'attachment; filename="bulk_submissions.zip"'
+        return response
 
     @action(detail=True, methods=('GET',))
     def get_details(self, request, pk):
@@ -482,47 +504,37 @@ class SubmissionViewSet(ModelViewSet):
 
     @action(detail=True, methods=('GET',))
     def get_detail_result(self, request, pk):
-        submission = get_object_or_404(Submission, pk=pk)
-        competition = submission.phase.competition
-
-        # Helper to avoid repeating serialization/Response code
-        def _allowed():
-            data = SubmissionFilesSerializer(submission, context=self.get_serializer_context()).data
-            return Response(data.get("detailed_result"), status=status.HTTP_200_OK)
-
+        submission = Submission.objects.get(pk=pk)
         # Check if competition show visualization is true
-        if competition.enable_detailed_results:
-            if competition.published:
-                # Detailed results are publicly available
-                return _allowed()
+        if submission.phase.competition.enable_detailed_results:
+            # get submission's competition approved participants
+            approved_participants = submission.phase.competition.participants.filter(status=CompetitionParticipant.APPROVED)
+            participant_usernames = [participant.user.username for participant in approved_participants]
+
+            # check if in this competition
+            # user is collaborator
+            # or
+            # user is approved participant
+            # or
+            # user is creator
+            # or
+            # user is super user
+            if request.user in submission.phase.competition.collaborators.all() or\
+                    request.user.username in participant_usernames or\
+                    request.user == submission.phase.competition.created_by or\
+                    request.user.is_superuser:
+
+                data = SubmissionFilesSerializer(submission, context=self.get_serializer_context()).data
+                return Response(data["detailed_result"], status=status.HTTP_200_OK)
+
             else:
-                # Competition is private
-                user = request.user
-                if not user.is_authenticated:
-                    return Response(
-                        {"error_msg": "You do not have permission to see the detailed result. Participate in this competition to view result."},
-                        status=status.HTTP_403_FORBIDDEN,
-                    )
-                # Give access if user is collaborator, approved participant,
-                # competition creator or super user
-                is_collaborator = competition.collaborators.filter(pk=user.pk).exists()
-                is_creator = (user == competition.created_by)
-                is_superuser = user.is_superuser
-                is_approved_participant = CompetitionParticipant.objects.filter(
-                    competition=competition,
-                    user=user,
-                    status=CompetitionParticipant.APPROVED,
-                ).exists()
-                if is_collaborator or is_approved_participant or is_creator or is_superuser:
-                    # Allow access
-                    return _allowed()
-            return Response(
-                {"error_msg": "You do not have permission to see the detailed result."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+                return Response({
+                    "error_msg": "You do not have permission to see the detailed result. Participate in this competition to view result."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
         else:
-            return Response(
-                {"error_msg": "Detailed results are disabled for this competition!"},
+            return Response({
+                "error_msg": "Detailed results are disable for this competition!"},
                 status=status.HTTP_404_NOT_FOUND
             )
 
